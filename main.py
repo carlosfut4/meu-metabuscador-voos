@@ -21,7 +21,15 @@ from fli.models import (
 )
 from fli.search import SearchDates, SearchFlights
 
-VERSION = 4
+try:
+    import fli.search.client as _fc
+    from fli.search._proto import encode_tfs_segment as _enc_seg, _varint_field as _vf, _to_urlsafe_b64 as _b64
+    from fli.search._proto import passenger_codes as _pax_codes
+except Exception:
+    _fc = None
+    _enc_seg = None
+
+VERSION = 5
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BODY = 20000
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "10800"))
@@ -39,6 +47,37 @@ class BadRequest(Exception):
 
 class Busy(Exception):
     pass
+
+
+_cool = {"until": 0.0}
+_gate = threading.BoundedSemaphore(max(1, int(os.environ.get("GOOGLE_CONC", "3"))))
+
+
+def _install_throttle():
+    if _fc is None:
+        return
+    try:
+        _fc.client = _fc.Client(calls_per_second=max(1, int(os.environ.get("RPS", "3"))))
+    except Exception:
+        pass
+    for name in ("get", "post"):
+        orig = getattr(_fc.Client, name)
+
+        def wrapped(self, *a, _orig=orig, **kw):
+            if time.time() < _cool["until"]:
+                raise Busy("O Google pediu uma pausa nas buscas (limite de consultas). Tente de novo em " + str(max(1, int((_cool["until"] - time.time()) // 60) + 1)) + " minuto(s).")
+            with _gate:
+                try:
+                    return _orig(self, *a, **kw)
+                except Exception as e:
+                    if "429" in str(e):
+                        _cool["until"] = time.time() + int(os.environ.get("COOLDOWN", "150"))
+                        raise Busy("O Google pediu uma pausa nas buscas (muitas consultas seguidas). Tente de novo em 3 minutos.")
+                    raise
+        setattr(_fc.Client, name, wrapped)
+
+
+_install_throttle()
 
 
 def cache_get(key):
@@ -209,6 +248,8 @@ def trips(body):
     hit = cache_get(key)
     if hit is not None:
         return hit
+    if trip_type(segs) == TripType.MULTI_CITY:
+        raise BadRequest("O Google não deixa mais buscar multidestinos automaticamente (desde agosto de 2026). Use o link para abrir a busca pronta no Google Voos.")
     filters = filters_for(body, segs)
     n = len(segs)
     top = max(1, min(8, int(body.get("expand", 4 if n <= 2 else (3 if n == 3 else 2)))))
@@ -322,7 +363,7 @@ def price_pairs(body, origin, dest, pairs, on_row=None):
             on_row(row)
         return row
 
-    with ThreadPoolExecutor(max_workers=max(1, min(10, int(os.environ.get("WORKERS", "6"))))) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, min(10, int(os.environ.get("WORKERS", "3"))))) as ex:
         return list(ex.map(run, pairs))
 
 
@@ -399,7 +440,9 @@ def explore(body, on_progress=None):
         raise BadRequest("A data final é antes da inicial.")
     trip = int(body.get("trip_days") or 0)
     trip = max(1, min(60, trip)) if trip else None
-    budget = max(10, min(240, int(os.environ.get("MAX_EXPLORE", "120"))))
+    budget = max(10, min(240, int(os.environ.get("MAX_EXPLORE", "60"))))
+    if body.get("budget"):
+        budget = max(5, min(budget, int(body.get("budget"))))
     per = max(1, budget // len(dests))
     span = (end - start).days + 1
     step = max(1, -(-span // per))
@@ -422,6 +465,26 @@ def explore(body, on_progress=None):
         res = list(ex.map(one, dests))
     res.sort(key=lambda r: (r["best"] is None, r["best"]["price"] if r["best"] else 0))
     return {"ok": True, "version": VERSION, "results": res, "sampled_dates": [s.isoformat() for s in samples], "step": step}
+
+
+
+def gf_link(body):
+    segs = segments_of(body)
+    currency = str(body.get("currency", "BRL")).upper()[:3]
+    if _enc_seg is None:
+        raise BadRequest("Link indisponível nesta versão da biblioteca.")
+    stops = STOPS.get(str(body.get("stops", "any")), MaxStops.ANY).value
+    data = b""
+    for o, d, dt in segs:
+        data += _enc_seg([code_of(o)], [code_of(d)], dt.isoformat(), legs=(), max_stops=stops - 1 if stops else None, carriers=[], carriers_exclude=[], layover_airports=[], min_layover=None, max_layover=None)
+    payload = _vf(1, 28) + _vf(2, 2) + data
+    for kind in _pax_codes(passengers(body)):
+        payload += _vf(8, kind)
+    seat = CABINS.get(str(body.get("cabin", "economy")), SeatType.ECONOMY).value
+    tt = trip_type(segs)
+    payload += _vf(9, seat) + _vf(14, 1) + _vf(19, 2 if tt == TripType.ONE_WAY else (1 if tt == TripType.ROUND_TRIP else 3))
+    url = "https://www.google.com/travel/flights?tfs=" + _b64(payload) + "&hl=pt-BR&gl=BR&curr=" + currency
+    return {"ok": True, "version": VERSION, "url": url}
 
 
 JOBS = {}
@@ -539,7 +602,7 @@ def start_job(body):
                     _job_save(jid)
                 res = explore(req, on_progress)
             _job_set(jid, status="done", result=res)
-        except (BadRequest, ValueError) as e:
+        except (BadRequest, ValueError, Busy) as e:
             _job_set(jid, status="error", error=str(e)[:300])
         except Exception as e:
             _job_set(jid, status="error", error="O Google não respondeu como esperado: " + type(e).__name__ + ": " + str(e)[:200])
@@ -566,10 +629,10 @@ def get_job(body):
     return out
 
 
-ROUTES = {"/search": search, "/v2/search": search, "/v2/dates": dates, "/v2/explore": explore, "/v3/search": trips, "/v3/prices": prices, "/v3/explore": explore, "/v4/jobs": start_job, "/v4/job": get_job}
+ROUTES = {"/search": search, "/v2/search": search, "/v2/dates": dates, "/v2/explore": explore, "/v3/search": trips, "/v3/prices": prices, "/v3/explore": explore, "/v4/jobs": start_job, "/v4/job": get_job, "/v5/link": gf_link}
 
 
-INFO = {"status": "online", "message": "API de voos funcionando", "version": VERSION, "features": ["jobs", "search", "roundtrip", "multicity", "prices", "dates", "explore", "children", "airline_direct"]}
+INFO = {"status": "online", "message": "API de voos funcionando", "version": VERSION, "features": ["link", "throttle", "jobs", "search", "roundtrip", "multicity", "prices", "dates", "explore", "children", "airline_direct"]}
 
 
 def handle(method, path, key, raw):
