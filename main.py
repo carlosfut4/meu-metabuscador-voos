@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,7 @@ from fli.models import (
 )
 from fli.search import SearchDates, SearchFlights
 
-VERSION = 3
+VERSION = 4
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BODY = 20000
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "10800"))
@@ -33,6 +34,10 @@ SORTS = {"cheapest": SortBy.CHEAPEST, "best": SortBy.BEST, "duration": SortBy.DU
 
 
 class BadRequest(Exception):
+    pass
+
+
+class Busy(Exception):
     pass
 
 
@@ -206,7 +211,7 @@ def trips(body):
         return hit
     filters = filters_for(body, segs)
     n = len(segs)
-    top = max(1, min(8, int(body.get("expand", 5 if n <= 2 else (3 if n == 3 else 2)))))
+    top = max(1, min(8, int(body.get("expand", 4 if n <= 2 else (3 if n == 3 else 2)))))
     client = SearchFlights()
     results = client.search(filters, top_n=top, currency=currency, language="pt-BR", country="BR") or []
     seen = set()
@@ -231,8 +236,9 @@ def trips(body):
             "_raw": raw,
         })
     if direct:
-        checks = max(1, min(12, int(body.get("direct_checks", 8))))
-        for item in [x for x in out if x["price"] is not None][:checks]:
+        checks = max(1, min(12, int(body.get("direct_checks", 6))))
+
+        def check(item):
             try:
                 opts = client.get_booking_options(item["_raw"], filters, currency=currency, language="pt-BR", country="BR") or []
             except Exception:
@@ -246,6 +252,9 @@ def trips(body):
                 others = [o for o in opts if o.price is not None]
                 if others:
                     item["vendor"] = min(others, key=lambda o: o.price).vendor_name
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(check, [x for x in out if x["price"] is not None][:checks]))
     for item in out:
         item.pop("_raw", None)
     data = {
@@ -275,7 +284,7 @@ def search(body):
     return dict(data, flights=flights, query={k: body.get(k) for k in ("origin", "destination", "departure_date", "return_date")})
 
 
-def price_pairs(body, origin, dest, pairs):
+def price_pairs(body, origin, dest, pairs, on_row=None):
     kw = dict(
         passenger_info=passengers(body),
         stops=STOPS.get(str(body.get("stops", "any")), MaxStops.ANY),
@@ -307,15 +316,21 @@ def price_pairs(body, origin, dest, pairs):
         cache_put(ck, row)
         return row
 
+    def run(p):
+        row = one(p)
+        if on_row:
+            on_row(row)
+        return row
+
     with ThreadPoolExecutor(max_workers=max(1, min(10, int(os.environ.get("WORKERS", "6"))))) as ex:
-        return list(ex.map(one, pairs))
+        return list(ex.map(run, pairs))
 
 
-def parse_pairs(body):
+def parse_pairs(body, cap=None):
     raw = body.get("pairs")
     if not isinstance(raw, list) or not raw:
         raise BadRequest("Informe as datas (pares ida/volta).")
-    cap = max(1, min(120, int(os.environ.get("MAX_PAIRS", "60"))))
+    cap = cap or max(1, min(120, int(os.environ.get("MAX_PAIRS", "60"))))
     if len(raw) > cap:
         raise BadRequest("Muitas datas numa busca só (máximo " + str(cap) + ").")
     out = []
@@ -366,7 +381,7 @@ def dates(body):
     return {"ok": True, "version": VERSION, "dates": rows, "cheapest": sorted(rows, key=lambda r: r["price"])[:10]}
 
 
-def explore(body):
+def explore(body, on_progress=None):
     origin = airport(body.get("origin"))
     dests = []
     for c in (body.get("destinations") or [])[:30]:
@@ -399,6 +414,8 @@ def explore(body):
     def one(dest):
         rows = [r for r in price_pairs(body, origin, dest, pairs_by_dest[dest]) if r["price"]]
         best = min(rows, key=lambda r: r["price"]) if rows else None
+        if on_progress:
+            on_progress(len(pairs_by_dest[dest]))
         return {"destination": code_of(dest), "best": best, "samples": sorted(rows, key=lambda r: r["date"])}
 
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -407,10 +424,100 @@ def explore(body):
     return {"ok": True, "version": VERSION, "results": res, "sampled_dates": [s.isoformat() for s in samples], "step": step}
 
 
-ROUTES = {"/search": search, "/v2/search": search, "/v2/dates": dates, "/v2/explore": explore, "/v3/search": trips, "/v3/prices": prices, "/v3/explore": explore}
+JOBS = {}
+_jobs_lock = threading.Lock()
+MAX_RUNNING = int(os.environ.get("MAX_JOBS", "4"))
 
 
-INFO = {"status": "online", "message": "API de voos funcionando", "version": VERSION, "features": ["search", "roundtrip", "multicity", "prices", "dates", "explore", "children", "airline_direct"]}
+def _job_set(jid, **kw):
+    with _jobs_lock:
+        if jid in JOBS:
+            JOBS[jid].update(kw)
+
+
+def start_job(body):
+    kind = str(body.get("kind", ""))
+    req = body.get("body")
+    if kind not in ("search", "prices", "explore") or not isinstance(req, dict):
+        raise BadRequest("Tipo de busca inválido.")
+    now = time.time()
+    with _jobs_lock:
+        for k in [k for k, j in JOBS.items() if j["created"] < now - 1800]:
+            JOBS.pop(k, None)
+        running = sum(1 for j in JOBS.values() if j["status"] == "running")
+    if kind == "search":
+        segments_of(req)
+        hit = cache_get(json.dumps(["t", req], sort_keys=True))
+        if hit is not None:
+            return {"ok": True, "version": VERSION, "id": None, "status": "done", "result": hit}
+        total = 1
+    elif kind == "prices":
+        airport(req.get("origin"))
+        airport(req.get("destination"))
+        total = len(parse_pairs(req, cap=150))
+    else:
+        airport(req.get("origin"))
+        total = max(1, len(req.get("destinations") or []))
+    if running >= MAX_RUNNING:
+        raise Busy("O metabuscador está ocupado com outras buscas. Tente de novo em 1 minuto.")
+    jid = secrets.token_urlsafe(18)
+    with _jobs_lock:
+        JOBS[jid] = {"status": "running", "created": now, "kind": kind, "done": 0, "total": total, "partial": [], "result": None, "error": None}
+
+    def work():
+        try:
+            if kind == "search":
+                res = trips(req)
+                _job_set(jid, done=1)
+            elif kind == "prices":
+                o = airport(req.get("origin"))
+                d = airport(req.get("destination"))
+
+                def on_row(row):
+                    with _jobs_lock:
+                        j = JOBS.get(jid)
+                        if j:
+                            j["done"] += 1
+                            if row.get("price"):
+                                j["partial"].append(row)
+                rows = price_pairs(req, o, d, parse_pairs(req, cap=150), on_row)
+                res = {"ok": True, "version": VERSION, "prices": rows}
+            else:
+                def on_progress(n):
+                    with _jobs_lock:
+                        j = JOBS.get(jid)
+                        if j:
+                            j["done"] += 1
+                res = explore(req, on_progress)
+            _job_set(jid, status="done", result=res)
+        except (BadRequest, ValueError) as e:
+            _job_set(jid, status="error", error=str(e)[:300])
+        except Exception as e:
+            _job_set(jid, status="error", error="O Google não respondeu como esperado: " + type(e).__name__ + ": " + str(e)[:200])
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"ok": True, "version": VERSION, "id": jid, "status": "running", "done": 0, "total": total}
+
+
+def get_job(body):
+    jid = str(body.get("id", ""))
+    since = max(0, int(body.get("since", 0) or 0))
+    with _jobs_lock:
+        j = JOBS.get(jid)
+        if not j:
+            raise BadRequest("Busca não encontrada (o servidor pode ter reiniciado). Busque de novo.")
+        out = {"ok": True, "version": VERSION, "id": jid, "status": j["status"], "done": j["done"], "total": j["total"], "partial": j["partial"][since:], "partial_count": len(j["partial"])}
+        if j["status"] == "done":
+            out["result"] = j["result"]
+        if j["status"] == "error":
+            out["error"] = j["error"]
+    return out
+
+
+ROUTES = {"/search": search, "/v2/search": search, "/v2/dates": dates, "/v2/explore": explore, "/v3/search": trips, "/v3/prices": prices, "/v3/explore": explore, "/v4/jobs": start_job, "/v4/job": get_job}
+
+
+INFO = {"status": "online", "message": "API de voos funcionando", "version": VERSION, "features": ["jobs", "search", "roundtrip", "multicity", "prices", "dates", "explore", "children", "airline_direct"]}
 
 
 def handle(method, path, key, raw):
@@ -436,6 +543,8 @@ def handle(method, path, key, raw):
         return 400, {"ok": False, "error": "JSON inválido."}
     try:
         return 200, fn(body)
+    except Busy as e:
+        return 429, {"ok": False, "error": str(e)}
     except (BadRequest, ValueError) as e:
         return 422, {"ok": False, "error": str(e)[:300]}
     except Exception as e:
