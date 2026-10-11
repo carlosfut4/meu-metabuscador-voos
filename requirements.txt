@@ -1,2 +1,2 @@
-flights==0.10.0
+flights @ git+https://github.com/punitarani/fli@881aee5ff4321e81ea2157cb44be94ce6a21dc1b
 uvicorn[standard]
