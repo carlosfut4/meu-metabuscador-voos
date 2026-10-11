@@ -20,7 +20,7 @@ from fli.models import (
 )
 from fli.search import SearchDates, SearchFlights
 
-VERSION = 2
+VERSION = 3
 API_KEY = os.environ.get("API_KEY", "")
 MAX_BODY = 20000
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "10800"))
@@ -108,7 +108,40 @@ def name_of(enum_value):
     return getattr(enum_value, "value", str(enum_value))
 
 
-def flight_json(f, currency):
+def segments_of(body):
+    raw = body.get("segments")
+    if not raw:
+        raw = [{"origin": body.get("origin"), "destination": body.get("destination"), "date": body.get("departure_date")}]
+        if body.get("return_date"):
+            raw.append({"origin": body.get("return_from") or body.get("destination"), "destination": body.get("origin"), "date": body.get("return_date")})
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 5:
+        raise BadRequest("Informe de 1 a 5 trechos.")
+    segs = []
+    last = None
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict):
+            raise BadRequest("Trecho inválido.")
+        o = airport(s.get("origin"))
+        d = airport(s.get("destination"))
+        if o == d:
+            raise BadRequest("Origem e destino iguais no trecho " + str(i + 1) + ".")
+        dt = day(s.get("date"), "Data do trecho " + str(i + 1))
+        if last and dt < last:
+            raise BadRequest("As datas dos trechos precisam estar em ordem.")
+        last = dt
+        segs.append((o, d, dt))
+    return segs
+
+
+def trip_type(segs):
+    if len(segs) == 1:
+        return TripType.ONE_WAY
+    if len(segs) == 2 and segs[0][0] == segs[1][1] and segs[0][1] == segs[1][0]:
+        return TripType.ROUND_TRIP
+    return TripType.MULTI_CITY
+
+
+def slice_json(f, currency):
     legs = [{
         "airline": name_of(l.airline),
         "airline_code": code_of(l.airline),
@@ -118,6 +151,7 @@ def flight_json(f, currency):
         "departure": l.departure_datetime.isoformat(),
         "arrival": l.arrival_datetime.isoformat(),
         "minutes": l.duration,
+        "operated_by": name_of(l.operating_airline) if getattr(l, "operating_airline", None) else None,
     } for l in f.legs]
     names = []
     for l in legs:
@@ -126,62 +160,79 @@ def flight_json(f, currency):
     return {
         "airline": ", ".join(names),
         "airline_codes": sorted({l["airline_code"] for l in legs}),
+        "from": legs[0]["from"] if legs else None,
+        "to": legs[-1]["to"] if legs else None,
         "departure": legs[0]["departure"] if legs else None,
         "arrival": legs[-1]["arrival"] if legs else None,
         "minutes": f.duration,
         "stops": f.stops,
-        "layovers": [{"airport": code_of(x.airport), "minutes": x.duration} for x in (f.layovers or [])],
-        "price": f.price,
-        "currency": f.currency or currency,
-        "legs": legs,
+        "layovers": [{"airport": code_of(x.airport), "minutes": x.duration, "overnight": bool(getattr(x, "overnight", False)), "change_airport": bool(getattr(x, "change_of_airport", False))} for x in (f.layovers or [])],
         "self_transfer": bool(getattr(f, "self_transfer", False)),
-        "airline_direct": None,
+        "emissions": getattr(f, "emissions_tag", None),
+        "legs": legs,
     }
 
 
-def search(body):
-    origin = airport(body.get("origin"))
-    dest = airport(body.get("destination"))
-    if origin == dest:
-        raise BadRequest("Origem e destino iguais.")
-    dep = day(body.get("departure_date"), "Data de ida")
-    ret = body.get("return_date")
-    ret = day(ret, "Data de volta") if ret else None
-    currency = str(body.get("currency", "EUR")).upper()[:3]
-    direct = bool(body.get("airline_direct", False))
-    limit = max(1, min(40, int(body.get("max_results", 20))))
-    key = json.dumps(["s", body], sort_keys=True)
-    hit = cache_get(key)
-    if hit is not None:
-        return dict(hit, cached=True)
-    segs = [FlightSegment(departure_airport=[[origin, 0]], arrival_airport=[[dest, 0]], travel_date=dep.isoformat())]
-    if ret:
-        segs.append(FlightSegment(departure_airport=[[dest, 0]], arrival_airport=[[origin, 0]], travel_date=ret.isoformat()))
-    filters = FlightSearchFilters(
-        trip_type=TripType.ROUND_TRIP if ret else TripType.ONE_WAY,
+def flight_json(f, currency):
+    out = slice_json(f, currency)
+    out.update({"price": f.price, "currency": f.currency or currency, "airline_direct": None})
+    return out
+
+
+def filters_for(body, segs):
+    return FlightSearchFilters(
+        trip_type=trip_type(segs),
         passenger_info=passengers(body),
-        flight_segments=segs,
+        flight_segments=[FlightSegment(departure_airport=[[o, 0]], arrival_airport=[[d, 0]], travel_date=dt.isoformat()) for o, d, dt in segs],
         stops=STOPS.get(str(body.get("stops", "any")), MaxStops.ANY),
         seat_type=CABINS.get(str(body.get("cabin", "economy")), SeatType.ECONOMY),
         sort_by=SORTS.get(str(body.get("sort", "cheapest")), SortBy.CHEAPEST),
         airlines=airlines(body.get("airlines")),
     )
+
+
+def itinerary_key(parts):
+    return "|".join(l.airline.name + l.flight_number + l.departure_datetime.isoformat() for p in parts for l in p.legs)
+
+
+def trips(body):
+    segs = segments_of(body)
+    currency = str(body.get("currency", "EUR")).upper()[:3]
+    direct = bool(body.get("airline_direct", False))
+    limit = max(1, min(80, int(body.get("max_results", 40))))
+    key = json.dumps(["t", body], sort_keys=True)
+    hit = cache_get(key)
+    if hit is not None:
+        return hit
+    filters = filters_for(body, segs)
+    n = len(segs)
+    top = max(1, min(8, int(body.get("expand", 5 if n <= 2 else (3 if n == 3 else 2)))))
     client = SearchFlights()
-    results = client.search(filters, top_n=5, currency=currency, language="pt-BR", country="BR") or []
+    results = client.search(filters, top_n=top, currency=currency, language="pt-BR", country="BR") or []
+    seen = set()
+    rows = []
+    for r in results:
+        parts = r if isinstance(r, tuple) else (r,)
+        k = itinerary_key(parts)
+        if k in seen:
+            continue
+        seen.add(k)
+        price = parts[-1].price if parts[-1].price is not None else parts[0].price
+        rows.append((price, parts, r))
+    rows.sort(key=lambda x: (x[0] is None, x[0] or 0))
+    rows = rows[:limit]
     out = []
-    for r in results[: limit]:
-        if isinstance(r, tuple):
-            item = flight_json(r[0], currency)
-            item["return"] = flight_json(r[-1], currency)
-            item["price"] = r[-1].price if r[-1].price is not None else r[0].price
-            item["_raw"] = r
-        else:
-            item = flight_json(r, currency)
-            item["_raw"] = r
-        out.append(item)
+    for price, parts, raw in rows:
+        out.append({
+            "price": price,
+            "currency": parts[-1].currency or currency,
+            "slices": [slice_json(p, currency) for p in parts],
+            "airline_direct": None,
+            "_raw": raw,
+        })
     if direct:
-        priced = sorted([x for x in out if x["price"] is not None], key=lambda x: x["price"])[: int(body.get("direct_checks", 6))]
-        for item in priced:
+        checks = max(1, min(12, int(body.get("direct_checks", 8))))
+        for item in [x for x in out if x["price"] is not None][:checks]:
             try:
                 opts = client.get_booking_options(item["_raw"], filters, currency=currency, language="pt-BR", country="BR") or []
             except Exception:
@@ -189,54 +240,114 @@ def search(body):
             airline_opts = [o for o in opts if o.is_airline_direct and o.price is not None]
             if airline_opts:
                 best = min(airline_opts, key=lambda o: o.price)
-                item["airline_direct"] = True
-                item["direct_price"] = best.price
-                item["vendor"] = best.vendor_name
-                item["booking_url"] = best.booking_url or best.google_click_url
+                item.update(airline_direct=True, direct_price=best.price, vendor=best.vendor_name, booking_url=best.booking_url or best.google_click_url)
             elif opts:
                 item["airline_direct"] = False
+                others = [o for o in opts if o.price is not None]
+                if others:
+                    item["vendor"] = min(others, key=lambda o: o.price).vendor_name
     for item in out:
         item.pop("_raw", None)
-    data = {"ok": True, "version": VERSION, "flights": out, "query": {k: body.get(k) for k in ("origin", "destination", "departure_date", "return_date")}}
+    data = {
+        "ok": True,
+        "version": VERSION,
+        "trip": trip_type(segs).name.lower(),
+        "segments": [{"origin": code_of(o), "destination": code_of(d), "date": dt.isoformat()} for o, d, dt in segs],
+        "itineraries": out,
+        "sparse": bool(getattr(client, "sparse_passenger_mix", False)) and not out,
+    }
     cache_put(key, data)
     return data
 
 
-def date_prices(body, origin, dest, start, end, trip_days):
-    filters_kw = dict(
+def search(body):
+    data = trips(dict(body, max_results=body.get("max_results", 20)))
+    flights = []
+    for it in data["itineraries"]:
+        item = dict(it["slices"][0])
+        item.update(price=it["price"], currency=it["currency"], airline_direct=it.get("airline_direct"))
+        for k in ("direct_price", "vendor", "booking_url"):
+            if k in it:
+                item[k] = it[k]
+        if len(it["slices"]) > 1:
+            item["return"] = it["slices"][-1]
+        flights.append(item)
+    return dict(data, flights=flights, query={k: body.get(k) for k in ("origin", "destination", "departure_date", "return_date")})
+
+
+def price_pairs(body, origin, dest, pairs):
+    kw = dict(
         passenger_info=passengers(body),
         stops=STOPS.get(str(body.get("stops", "any")), MaxStops.ANY),
         seat_type=CABINS.get(str(body.get("cabin", "economy")), SeatType.ECONOMY),
         airlines=airlines(body.get("airlines")),
     )
     currency = str(body.get("currency", "EUR")).upper()[:3]
-    out = []
-    cur = start
-    while cur <= end:
-        chunk_end = min(end, cur + timedelta(days=90))
-        segs = [FlightSegment(departure_airport=[[origin, 0]], arrival_airport=[[dest, 0]], travel_date=cur.isoformat())]
-        kw = dict(filters_kw)
-        if trip_days:
-            segs.append(FlightSegment(departure_airport=[[dest, 0]], arrival_airport=[[origin, 0]], travel_date=(cur + timedelta(days=trip_days)).isoformat()))
-            kw.update(trip_type=TripType.ROUND_TRIP, duration=trip_days)
+
+    def one(p):
+        dep, ret = p
+        segs = [FlightSegment(departure_airport=[[origin, 0]], arrival_airport=[[dest, 0]], travel_date=dep.isoformat())]
+        k = dict(kw)
+        if ret:
+            segs.append(FlightSegment(departure_airport=[[dest, 0]], arrival_airport=[[origin, 0]], travel_date=ret.isoformat()))
+            k.update(trip_type=TripType.ROUND_TRIP, duration=(ret - dep).days)
         else:
-            kw.update(trip_type=TripType.ONE_WAY)
-        f = DateSearchFilters(flight_segments=segs, from_date=cur.isoformat(), to_date=chunk_end.isoformat(), **kw)
+            k.update(trip_type=TripType.ONE_WAY)
+        ck = json.dumps(["p", code_of(origin), code_of(dest), dep.isoformat(), ret.isoformat() if ret else None, currency, body.get("adults"), body.get("children"), body.get("infants_seat"), body.get("infants_lap"), body.get("stops"), body.get("cabin"), body.get("airlines")])
+        hit = cache_get(ck)
+        if hit is not None:
+            return hit
+        f = DateSearchFilters(flight_segments=segs, from_date=dep.isoformat(), to_date=dep.isoformat(), **k)
         try:
             res = SearchDates().search(f, currency=currency, language="pt-BR", country="BR") or []
-        except Exception as e:
-            if not out and chunk_end >= end:
-                raise
-            res = []
-        for r in res:
-            out.append({
-                "date": r.date[0].date().isoformat(),
-                "return_date": r.date[1].date().isoformat() if len(r.date) > 1 else None,
-                "price": r.price,
-                "currency": r.currency or currency,
-            })
-        cur = chunk_end + timedelta(days=1)
+        except Exception:
+            return {"date": dep.isoformat(), "return_date": ret.isoformat() if ret else None, "price": None, "error": True}
+        price = min([r.price for r in res if r.price], default=None)
+        row = {"date": dep.isoformat(), "return_date": ret.isoformat() if ret else None, "price": price, "currency": (res[0].currency if res and res[0].currency else currency)}
+        cache_put(ck, row)
+        return row
+
+    with ThreadPoolExecutor(max_workers=max(1, min(10, int(os.environ.get("WORKERS", "6"))))) as ex:
+        return list(ex.map(one, pairs))
+
+
+def parse_pairs(body):
+    raw = body.get("pairs")
+    if not isinstance(raw, list) or not raw:
+        raise BadRequest("Informe as datas (pares ida/volta).")
+    cap = max(1, min(120, int(os.environ.get("MAX_PAIRS", "60"))))
+    if len(raw) > cap:
+        raise BadRequest("Muitas datas numa busca só (máximo " + str(cap) + ").")
+    out = []
+    for p in raw:
+        if not isinstance(p, (list, tuple)) or not 1 <= len(p) <= 2:
+            raise BadRequest("Par de datas inválido.")
+        dep = day(p[0], "Data de ida")
+        ret = day(p[1], "Data de volta") if len(p) > 1 and p[1] else None
+        if ret and ret <= dep:
+            raise BadRequest("A volta precisa ser depois da ida.")
+        if ret and (ret - dep).days > 60:
+            raise BadRequest("Viagem de no máximo 60 dias.")
+        out.append((dep, ret))
     return out
+
+
+def prices(body):
+    origin = airport(body.get("origin"))
+    dest = airport(body.get("destination"))
+    if origin == dest:
+        raise BadRequest("Origem e destino iguais.")
+    rows = price_pairs(body, origin, dest, parse_pairs(body))
+    return {"ok": True, "version": VERSION, "prices": rows}
+
+
+def date_prices(body, origin, dest, start, end, trip_days):
+    pairs = []
+    d = start
+    while d <= end and len(pairs) < 93:
+        pairs.append((d, d + timedelta(days=trip_days) if trip_days else None))
+        d += timedelta(days=1)
+    return [r for r in price_pairs(body, origin, dest, pairs) if r["price"]]
 
 
 def dates(body):
@@ -246,19 +357,13 @@ def dates(body):
     end = day(body.get("to_date"), "Data final")
     if end < start:
         raise BadRequest("A data final é antes da inicial.")
-    if (end - start).days > 185:
-        raise BadRequest("Período máximo de 6 meses por busca.")
+    if (end - start).days > 92:
+        raise BadRequest("Período máximo de 93 dias por busca.")
     trip = int(body.get("trip_days") or 0)
     trip = max(1, min(60, trip)) if trip else None
-    key = json.dumps(["d", body], sort_keys=True)
-    hit = cache_get(key)
-    if hit is not None:
-        return dict(hit, cached=True)
     rows = date_prices(body, origin, dest, start, end, trip)
     rows.sort(key=lambda r: r["date"])
-    data = {"ok": True, "version": VERSION, "dates": rows, "cheapest": sorted(rows, key=lambda r: r["price"])[:10]}
-    cache_put(key, data)
-    return data
+    return {"ok": True, "version": VERSION, "dates": rows, "cheapest": sorted(rows, key=lambda r: r["price"])[:10]}
 
 
 def explore(body):
@@ -277,44 +382,35 @@ def explore(body):
     end = day(body.get("to_date"), "Data final")
     if end < start:
         raise BadRequest("A data final é antes da inicial.")
-    step = max(1, min(30, int(body.get("sample_every", 7))))
     trip = int(body.get("trip_days") or 0)
     trip = max(1, min(60, trip)) if trip else None
+    budget = max(10, min(240, int(os.environ.get("MAX_EXPLORE", "120"))))
+    per = max(1, budget // len(dests))
+    span = (end - start).days + 1
+    step = max(1, -(-span // per))
+    step = max(step, max(1, min(30, int(body.get("sample_every", 1)))))
     samples = []
     d = start
-    while d <= end and len(samples) < 26:
+    while d <= end and len(samples) < per:
         samples.append(d)
         d += timedelta(days=step)
-    if len(dests) * len(samples) > 240:
-        raise BadRequest("Busca grande demais: diminua os destinos ou aumente o intervalo entre datas.")
-    key = json.dumps(["e", body], sort_keys=True)
-    hit = cache_get(key)
-    if hit is not None:
-        return dict(hit, cached=True)
+    pairs_by_dest = {dest: [(s, s + timedelta(days=trip) if trip else None) for s in samples] for dest in dests}
 
     def one(dest):
-        rows = []
-        for s in samples:
-            try:
-                rows += date_prices(body, origin, dest, s, s, trip)
-            except Exception:
-                continue
-        rows = [r for r in rows if r["price"]]
+        rows = [r for r in price_pairs(body, origin, dest, pairs_by_dest[dest]) if r["price"]]
         best = min(rows, key=lambda r: r["price"]) if rows else None
         return {"destination": code_of(dest), "best": best, "samples": sorted(rows, key=lambda r: r["date"])}
 
-    with ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "6"))) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         res = list(ex.map(one, dests))
     res.sort(key=lambda r: (r["best"] is None, r["best"]["price"] if r["best"] else 0))
-    data = {"ok": True, "version": VERSION, "results": res, "sampled_dates": [s.isoformat() for s in samples]}
-    cache_put(key, data)
-    return data
+    return {"ok": True, "version": VERSION, "results": res, "sampled_dates": [s.isoformat() for s in samples], "step": step}
 
 
-ROUTES = {"/search": search, "/v2/search": search, "/v2/dates": dates, "/v2/explore": explore}
+ROUTES = {"/search": search, "/v2/search": search, "/v2/dates": dates, "/v2/explore": explore, "/v3/search": trips, "/v3/prices": prices, "/v3/explore": explore}
 
 
-INFO = {"status": "online", "message": "API de voos funcionando", "version": VERSION, "features": ["search", "dates", "explore", "children", "airline_direct"]}
+INFO = {"status": "online", "message": "API de voos funcionando", "version": VERSION, "features": ["search", "roundtrip", "multicity", "prices", "dates", "explore", "children", "airline_direct"]}
 
 
 def handle(method, path, key, raw):
