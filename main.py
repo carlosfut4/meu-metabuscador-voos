@@ -429,10 +429,51 @@ _jobs_lock = threading.Lock()
 MAX_RUNNING = int(os.environ.get("MAX_JOBS", "4"))
 
 
+JOB_DIR = os.environ.get("JOB_DIR", "/tmp/metabuscador-jobs")
+_saved = {}
+
+
+def _job_file(jid):
+    return os.path.join(JOB_DIR, "".join(c for c in jid if c.isalnum() or c in "-_") + ".json")
+
+
+def _job_save(jid, force=False):
+    now = time.time()
+    if not force and now - _saved.get(jid, 0) < 1.0:
+        return
+    _saved[jid] = now
+    with _jobs_lock:
+        j = JOBS.get(jid)
+        data = json.dumps(j, default=str) if j else None
+    if data is None:
+        return
+    try:
+        os.makedirs(JOB_DIR, exist_ok=True)
+        tmp = _job_file(jid) + "." + str(os.getpid()) + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(data)
+        os.replace(tmp, _job_file(jid))
+    except OSError:
+        pass
+
+
+def _job_load(jid):
+    try:
+        with open(_job_file(jid)) as f:
+            j = json.load(f)
+        if j.get("status") == "running" and j.get("created", 0) < time.time() - 900:
+            j["status"] = "error"
+            j["error"] = "A busca parou no meio (o servidor reiniciou). Busque de novo."
+        return j
+    except (OSError, ValueError):
+        return None
+
+
 def _job_set(jid, **kw):
     with _jobs_lock:
         if jid in JOBS:
             JOBS[jid].update(kw)
+    _job_save(jid, force=True)
 
 
 def start_job(body):
@@ -444,6 +485,11 @@ def start_job(body):
     with _jobs_lock:
         for k in [k for k, j in JOBS.items() if j["created"] < now - 1800]:
             JOBS.pop(k, None)
+            _saved.pop(k, None)
+            try:
+                os.remove(_job_file(k))
+            except OSError:
+                pass
         running = sum(1 for j in JOBS.values() if j["status"] == "running")
     if kind == "search":
         segments_of(req)
@@ -463,6 +509,7 @@ def start_job(body):
     jid = secrets.token_urlsafe(18)
     with _jobs_lock:
         JOBS[jid] = {"status": "running", "created": now, "kind": kind, "done": 0, "total": total, "partial": [], "result": None, "error": None}
+    _job_save(jid, force=True)
 
     def work():
         try:
@@ -480,6 +527,7 @@ def start_job(body):
                             j["done"] += 1
                             if row.get("price"):
                                 j["partial"].append(row)
+                    _job_save(jid)
                 rows = price_pairs(req, o, d, parse_pairs(req, cap=150), on_row)
                 res = {"ok": True, "version": VERSION, "prices": rows}
             else:
@@ -488,6 +536,7 @@ def start_job(body):
                         j = JOBS.get(jid)
                         if j:
                             j["done"] += 1
+                    _job_save(jid)
                 res = explore(req, on_progress)
             _job_set(jid, status="done", result=res)
         except (BadRequest, ValueError) as e:
@@ -504,8 +553,11 @@ def get_job(body):
     since = max(0, int(body.get("since", 0) or 0))
     with _jobs_lock:
         j = JOBS.get(jid)
-        if not j:
-            raise BadRequest("Busca não encontrada (o servidor pode ter reiniciado). Busque de novo.")
+    if not j:
+        j = _job_load(jid)
+    if not j:
+        raise BadRequest("Busca não encontrada (o servidor pode ter reiniciado). Busque de novo.")
+    with _jobs_lock:
         out = {"ok": True, "version": VERSION, "id": jid, "status": j["status"], "done": j["done"], "total": j["total"], "partial": j["partial"][since:], "partial_count": len(j["partial"])}
         if j["status"] == "done":
             out["result"] = j["result"]
